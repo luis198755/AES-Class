@@ -9,8 +9,13 @@ public:
     AESEncryption(const uint8_t* key, size_t keySize);
     ~AESEncryption();
 
-    bool encrypt(const uint8_t* input, size_t inputLength, uint8_t* output, size_t* outputLength);
-    bool decrypt(const uint8_t* input, size_t inputLength, uint8_t* output, size_t* outputLength);
+    bool encrypt(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
+                 const uint8_t* input, size_t inputLength, 
+                 uint8_t* output, size_t* outputLength);
+
+    bool decrypt(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
+                 const uint8_t* input, size_t inputLength, 
+                 uint8_t* output, size_t* outputLength);
     
     void encryptAndDecrypt(const char* message);
 
@@ -20,6 +25,10 @@ private:
     size_t m_keySize;
 
     static const size_t BLOCK_SIZE = 16;  // Tamaño de bloque AES en bytes
+
+    bool ctrOperation(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
+                      const uint8_t* input, size_t inputLength, 
+                      uint8_t* output, size_t* outputLength);
 };
 
 AESEncryption::AESEncryption(const uint8_t* key, size_t keySize) : m_keySize(keySize) {
@@ -36,69 +45,73 @@ AESEncryption::~AESEncryption() {
     memset(m_key, 0, sizeof(m_key));
 }
 
-bool AESEncryption::encrypt(const uint8_t* input, size_t inputLength, uint8_t* output, size_t* outputLength) {
-    size_t blocks = (inputLength + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    if (*outputLength < blocks * BLOCK_SIZE) {
-        return false;
+bool AESEncryption::ctrOperation(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
+                                 const uint8_t* input, size_t inputLength, 
+                                 uint8_t* output, size_t* outputLength) {
+    if (nonceSize > BLOCK_SIZE - 4) {
+        return false;  // El nonce es demasiado grande
     }
 
-    for (size_t i = 0; i < blocks; i++) {
-        if (mbedtls_aes_crypt_ecb(&m_aesContext, MBEDTLS_AES_ENCRYPT, 
-                                  input + i * BLOCK_SIZE, 
-                                  output + i * BLOCK_SIZE) != 0) {
-            return false;
-        }
-    }
+    uint8_t counterBlock[BLOCK_SIZE];
+    uint8_t streamBlock[BLOCK_SIZE];
+    size_t nc_off = 0;
 
-    *outputLength = blocks * BLOCK_SIZE;
-    return true;
+    memcpy(counterBlock, nonce, nonceSize);
+    for (int i = nonceSize; i < BLOCK_SIZE - 4; i++) {
+        counterBlock[i] = 0;
+    }
+    counterBlock[BLOCK_SIZE - 4] = (counter >> 24) & 0xFF;
+    counterBlock[BLOCK_SIZE - 3] = (counter >> 16) & 0xFF;
+    counterBlock[BLOCK_SIZE - 2] = (counter >> 8) & 0xFF;
+    counterBlock[BLOCK_SIZE - 1] = counter & 0xFF;
+
+    return mbedtls_aes_crypt_ctr(&m_aesContext, inputLength, &nc_off, counterBlock, streamBlock, input, output) == 0;
 }
 
-bool AESEncryption::decrypt(const uint8_t* input, size_t inputLength, uint8_t* output, size_t* outputLength) {
-    if (inputLength % BLOCK_SIZE != 0 || *outputLength < inputLength) {
-        return false;
-    }
-
-    size_t blocks = inputLength / BLOCK_SIZE;
-
-    for (size_t i = 0; i < blocks; i++) {
-        if (mbedtls_aes_crypt_ecb(&m_aesContext, MBEDTLS_AES_DECRYPT, 
-                                  input + i * BLOCK_SIZE, 
-                                  output + i * BLOCK_SIZE) != 0) {
-            return false;
-        }
-    }
-
+bool AESEncryption::encrypt(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
+                            const uint8_t* input, size_t inputLength, 
+                            uint8_t* output, size_t* outputLength) {
     *outputLength = inputLength;
-    return true;
+    return ctrOperation(nonce, nonceSize, counter, input, inputLength, output, outputLength);
+}
+
+bool AESEncryption::decrypt(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
+                            const uint8_t* input, size_t inputLength, 
+                            uint8_t* output, size_t* outputLength) {
+    // En CTR, la operación de descifrado es idéntica a la de cifrado
+    return encrypt(nonce, nonceSize, counter, input, inputLength, output, outputLength);
 }
 
 void AESEncryption::encryptAndDecrypt(const char* message) {
     size_t messageLength = strlen(message);
-    size_t paddedLength = ((messageLength + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    uint8_t* plaintext = new uint8_t[messageLength];
+    uint8_t* ciphertext = new uint8_t[messageLength];
+    uint8_t* decrypted = new uint8_t[messageLength];
     
-    uint8_t* plaintext = new uint8_t[paddedLength];
-    uint8_t* ciphertext = new uint8_t[paddedLength];
-    uint8_t* decrypted = new uint8_t[paddedLength];
-    
-    memset(plaintext, 0, paddedLength);
     memcpy(plaintext, message, messageLength);
 
-    size_t outputLength = paddedLength;
+    // Generamos un nonce aleatorio (en un escenario real, esto debería ser único para cada mensaje)
+    uint8_t nonce[12];
+    for (int i = 0; i < 12; i++) {
+        nonce[i] = random(256);
+    }
+    uint32_t counter = 1;  // Iniciamos el contador en 1
+
+    size_t outputLength = messageLength;
 
     Serial.println("Mensaje original: " + String(message));
 
-    if (encrypt(plaintext, paddedLength, ciphertext, &outputLength)) {
+    if (encrypt(nonce, sizeof(nonce), counter, plaintext, messageLength, ciphertext, &outputLength)) {
         Serial.print("Texto cifrado: ");
         for (size_t i = 0; i < outputLength; i++) {
             Serial.printf("%02X", ciphertext[i]);
         }
         Serial.println();
 
-        outputLength = paddedLength;
-        if (decrypt(ciphertext, paddedLength, decrypted, &outputLength)) {
+        if (decrypt(nonce, sizeof(nonce), counter, ciphertext, outputLength, decrypted, &outputLength)) {
             Serial.print("Mensaje descifrado: ");
-            Serial.println((char*)decrypted);
+            Serial.write(decrypted, outputLength);
+            Serial.println();
         } else {
             Serial.println("Falló el descifrado");
         }
