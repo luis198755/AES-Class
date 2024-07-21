@@ -3,125 +3,124 @@
 
 #include <Arduino.h>
 #include <mbedtls/aes.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
 
 class AESEncryption {
 public:
-    AESEncryption(const uint8_t* key, size_t keySize);
+    AESEncryption();
     ~AESEncryption();
 
-    bool encrypt(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
-                 const uint8_t* input, size_t inputLength, 
-                 uint8_t* output, size_t* outputLength);
-
-    bool decrypt(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
-                 const uint8_t* input, size_t inputLength, 
-                 uint8_t* output, size_t* outputLength);
-    
-    void encryptAndDecrypt(const char* message);
+    String encrypt(const uint8_t* key, size_t keySize, const String& plaintext, String& nonce);
+    String decrypt(const uint8_t* key, size_t keySize, const String& ciphertext, const String& nonce);
 
 private:
     mbedtls_aes_context m_aesContext;
-    uint8_t m_key[32];  // Soporte para claves de hasta 256 bits
-    size_t m_keySize;
+    mbedtls_entropy_context m_entropy;
+    mbedtls_ctr_drbg_context m_ctrDrbg;
 
-    static const size_t BLOCK_SIZE = 16;  // Tamaño de bloque AES en bytes
+    static const size_t BLOCK_SIZE = 16;
+    static const size_t NONCE_SIZE = 12;
 
-    bool ctrOperation(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
-                      const uint8_t* input, size_t inputLength, 
-                      uint8_t* output, size_t* outputLength);
+    void initializeRNG();
+    String bytesToHex(const uint8_t* bytes, size_t len);
+    void hexToBytes(const String& hex, uint8_t* bytes, size_t len);
+    void createInitialCounter(const uint8_t* nonce, uint32_t counter, uint8_t* initialCounter);
 };
 
-AESEncryption::AESEncryption(const uint8_t* key, size_t keySize) : m_keySize(keySize) {
-    if (keySize > sizeof(m_key)) {
-        m_keySize = sizeof(m_key);
-    }
-    memcpy(m_key, key, m_keySize);
+AESEncryption::AESEncryption() {
     mbedtls_aes_init(&m_aesContext);
-    mbedtls_aes_setkey_enc(&m_aesContext, m_key, m_keySize * 8);
+    initializeRNG();
 }
 
 AESEncryption::~AESEncryption() {
     mbedtls_aes_free(&m_aesContext);
-    memset(m_key, 0, sizeof(m_key));
+    mbedtls_ctr_drbg_free(&m_ctrDrbg);
+    mbedtls_entropy_free(&m_entropy);
 }
 
-bool AESEncryption::ctrOperation(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
-                                 const uint8_t* input, size_t inputLength, 
-                                 uint8_t* output, size_t* outputLength) {
-    if (nonceSize > BLOCK_SIZE - 4) {
-        return false;  // El nonce es demasiado grande
-    }
+void AESEncryption::initializeRNG() {
+    mbedtls_entropy_init(&m_entropy);
+    mbedtls_ctr_drbg_init(&m_ctrDrbg);
+    mbedtls_ctr_drbg_seed(&m_ctrDrbg, mbedtls_entropy_func, &m_entropy, nullptr, 0);
+}
 
-    uint8_t counterBlock[BLOCK_SIZE];
+String AESEncryption::encrypt(const uint8_t* key, size_t keySize, const String& plaintext, String& nonce) {
+    mbedtls_aes_setkey_enc(&m_aesContext, key, keySize * 8);
+
+    uint8_t nonceBytes[NONCE_SIZE];
+    mbedtls_ctr_drbg_random(&m_ctrDrbg, nonceBytes, NONCE_SIZE);
+    nonce = bytesToHex(nonceBytes, NONCE_SIZE);
+
+    size_t plaintextLength = plaintext.length();
+    size_t ciphertextLength = plaintextLength;
+    uint8_t* ciphertext = new uint8_t[ciphertextLength];
+
+    uint8_t initialCounter[BLOCK_SIZE];
+    createInitialCounter(nonceBytes, 1, initialCounter);
+
     uint8_t streamBlock[BLOCK_SIZE];
     size_t nc_off = 0;
 
-    memcpy(counterBlock, nonce, nonceSize);
-    for (int i = nonceSize; i < BLOCK_SIZE - 4; i++) {
-        counterBlock[i] = 0;
-    }
-    counterBlock[BLOCK_SIZE - 4] = (counter >> 24) & 0xFF;
-    counterBlock[BLOCK_SIZE - 3] = (counter >> 16) & 0xFF;
-    counterBlock[BLOCK_SIZE - 2] = (counter >> 8) & 0xFF;
-    counterBlock[BLOCK_SIZE - 1] = counter & 0xFF;
+    mbedtls_aes_crypt_ctr(&m_aesContext, plaintextLength, &nc_off, initialCounter, streamBlock, 
+                          (const uint8_t*)plaintext.c_str(), ciphertext);
 
-    return mbedtls_aes_crypt_ctr(&m_aesContext, inputLength, &nc_off, counterBlock, streamBlock, input, output) == 0;
-}
-
-bool AESEncryption::encrypt(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
-                            const uint8_t* input, size_t inputLength, 
-                            uint8_t* output, size_t* outputLength) {
-    *outputLength = inputLength;
-    return ctrOperation(nonce, nonceSize, counter, input, inputLength, output, outputLength);
-}
-
-bool AESEncryption::decrypt(const uint8_t* nonce, size_t nonceSize, uint32_t counter,
-                            const uint8_t* input, size_t inputLength, 
-                            uint8_t* output, size_t* outputLength) {
-    // En CTR, la operación de descifrado es idéntica a la de cifrado
-    return encrypt(nonce, nonceSize, counter, input, inputLength, output, outputLength);
-}
-
-void AESEncryption::encryptAndDecrypt(const char* message) {
-    size_t messageLength = strlen(message);
-    uint8_t* plaintext = new uint8_t[messageLength];
-    uint8_t* ciphertext = new uint8_t[messageLength];
-    uint8_t* decrypted = new uint8_t[messageLength];
-    
-    memcpy(plaintext, message, messageLength);
-
-    // Generamos un nonce aleatorio (en un escenario real, esto debería ser único para cada mensaje)
-    uint8_t nonce[12];
-    for (int i = 0; i < 12; i++) {
-        nonce[i] = random(256);
-    }
-    uint32_t counter = 1;  // Iniciamos el contador en 1
-
-    size_t outputLength = messageLength;
-
-    Serial.println("Mensaje original: " + String(message));
-
-    if (encrypt(nonce, sizeof(nonce), counter, plaintext, messageLength, ciphertext, &outputLength)) {
-        Serial.print("Texto cifrado: ");
-        for (size_t i = 0; i < outputLength; i++) {
-            Serial.printf("%02X", ciphertext[i]);
-        }
-        Serial.println();
-
-        if (decrypt(nonce, sizeof(nonce), counter, ciphertext, outputLength, decrypted, &outputLength)) {
-            Serial.print("Mensaje descifrado: ");
-            Serial.write(decrypted, outputLength);
-            Serial.println();
-        } else {
-            Serial.println("Falló el descifrado");
-        }
-    } else {
-        Serial.println("Falló el cifrado");
-    }
-
-    delete[] plaintext;
+    String result = bytesToHex(ciphertext, ciphertextLength);
     delete[] ciphertext;
-    delete[] decrypted;
+
+    return result;
+}
+
+String AESEncryption::decrypt(const uint8_t* key, size_t keySize, const String& ciphertext, const String& nonce) {
+    mbedtls_aes_setkey_enc(&m_aesContext, key, keySize * 8);
+
+    size_t ciphertextLength = ciphertext.length() / 2;  // Dos caracteres hex por byte
+    uint8_t* ciphertextBytes = new uint8_t[ciphertextLength];
+    hexToBytes(ciphertext, ciphertextBytes, ciphertextLength);
+
+    uint8_t nonceBytes[NONCE_SIZE];
+    hexToBytes(nonce, nonceBytes, NONCE_SIZE);
+
+    uint8_t* plaintext = new uint8_t[ciphertextLength];
+
+    uint8_t initialCounter[BLOCK_SIZE];
+    createInitialCounter(nonceBytes, 1, initialCounter);
+
+    uint8_t streamBlock[BLOCK_SIZE];
+    size_t nc_off = 0;
+
+    mbedtls_aes_crypt_ctr(&m_aesContext, ciphertextLength, &nc_off, initialCounter, streamBlock, 
+                          ciphertextBytes, plaintext);
+
+    String result((char*)plaintext, ciphertextLength);
+    delete[] ciphertextBytes;
+    delete[] plaintext;
+
+    return result;
+}
+
+String AESEncryption::bytesToHex(const uint8_t* bytes, size_t len) {
+    String result;
+    for (size_t i = 0; i < len; i++) {
+        char hex[3];
+        sprintf(hex, "%02X", bytes[i]);
+        result += hex;
+    }
+    return result;
+}
+
+void AESEncryption::hexToBytes(const String& hex, uint8_t* bytes, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        sscanf(hex.c_str() + 2*i, "%2hhx", &bytes[i]);
+    }
+}
+
+void AESEncryption::createInitialCounter(const uint8_t* nonce, uint32_t counter, uint8_t* initialCounter) {
+    memcpy(initialCounter, nonce, NONCE_SIZE);
+    initialCounter[12] = (counter >> 24) & 0xFF;
+    initialCounter[13] = (counter >> 16) & 0xFF;
+    initialCounter[14] = (counter >> 8) & 0xFF;
+    initialCounter[15] = counter & 0xFF;
 }
 
 #endif // AES_ENCRYPTION_H
